@@ -6,17 +6,9 @@ import tempfile
 import numpy as np
 import numpy.typing as npt
 from typing import List, Dict, Tuple
-from settings import MARABOU_BIN
 import os
-import subprocess
-import json
 import sys
 from parse import parse
-
-
-ZERO = 10**-6
-NUM_THREADS = 30
-TIMEOUT = 600
 
 cex_file = sys.argv[1]
 
@@ -35,7 +27,7 @@ adv_label = int(adv_label)
 input = prepared_data[input_idx]["h"]
 
 #extract input and output var assignments computed by Marabou
-v = []
+v:List[float] = []
 with open(cex_file, "r") as f:
     data = f.readlines()
 
@@ -51,9 +43,9 @@ probe_vars:List[float] = v[512+61:512+61+192]
 output_vars: List[float] = v[512:512+61+192]
 
 #run the input through the network
-output = trinity(torch.Tensor(input_vars))
-logits = output.squeeze()[:61]
-probe = output.squeeze()[61:]
+output: torch.Tensor = trinity(torch.Tensor(input_vars))
+logits: torch.Tensor = output.squeeze()[:61]
+probe: torch.Tensor = output.squeeze()[61:]
 
 #assert that Marabou output and the computed output are the same
 assert torch.allclose(output.squeeze(), torch.Tensor(output_vars), atol=10**-5), f"{output.squeeze()[:10]} != {output_vars[:10]}"
