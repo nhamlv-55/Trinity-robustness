@@ -10,6 +10,7 @@ from settings import MARABOU_BIN
 import os
 import subprocess
 import json
+
 ZERO = 10**-6
 NUM_THREADS = 30
 TIMEOUT = 600
@@ -41,8 +42,41 @@ def ge_constraint(x:int, y:int, prt:bool = False)->MarabouUtils.Equation:
         print(c)
     return c
 
-def trinity_robustness(input, sid:int, eps:float, sanity_check:bool = False):
-    h = input["h"]
+def init_marabou_network(onnx_path: str, h: List[float], eps:float):
+    """
+    load the onnx network and setup input bounds, then return the query
+    """
+    marabou_net = Marabou.read_onnx(onnx_path)
+
+    ipq = marabou_net.getForwardQuery()
+
+    input_vars: List[int] = np.array(marabou_net.inputVars).flatten().tolist()
+    print(input_vars)
+    output_vars: List[int] = np.array(marabou_net.outputVars).flatten().tolist()
+    logit_vars: List[int] = output_vars[:61]
+    probe_vars: List[int] = output_vars[61:]
+    assert len(logit_vars) == 61
+    assert len(probe_vars) == 192
+    assert len(input_vars) == len(h)
+    print("logit vars:", logit_vars)
+    print("probe_vars:", probe_vars)
+
+    print("setting bounds for input")
+    for idx, v in enumerate(input_vars):
+        ipq.setLowerBound(v, h[idx]-eps)
+        ipq.setUpperBound(v, h[idx]+eps)
+
+    return ipq, logit_vars, probe_vars
+
+def trinity_robustness(input, sid:int, eps:float, robust_property: str, sanity_check:bool = False):
+    """
+    verify one of the two properties:
+    1 - input in range ^ output of probe stays the same => head produce the same output
+    2 - input in range ^ output of head stays the same => output of probe stays the same
+    """
+    assert robust_property in ["Probe-robust", "Head-robust"]
+
+    h: List[float] = input["h"]
     true_label:int = input["argmax_logits"]
     other_labels = set(range(61))
     other_labels.remove(true_label)
@@ -52,32 +86,13 @@ def trinity_robustness(input, sid:int, eps:float, sanity_check:bool = False):
     tempf = tempfile.NamedTemporaryFile(delete=False)
     torch.onnx.export(trinity, torch.Tensor(h), tempf.name, verbose=False)
 
-
+    #start building queries and solving
     for other_l in other_labels:
-        marabou_net = Marabou.read_onnx(tempf.name)
+        ipq, logit_vars, probe_vars = init_marabou_network(tempf.name, h, eps)
 
-        ipq = marabou_net.getForwardQuery()
-
-        input_vars: List[int] = np.array(marabou_net.inputVars).flatten().tolist()
-        print(input_vars)
-        output_vars: List[int] = np.array(marabou_net.outputVars).flatten().tolist()
-        logit_vars: List[int] = output_vars[:61]
-        probe_vars: List[int] = output_vars[61:]
-        assert len(logit_vars) == 61
-        assert len(probe_vars) == 192
-        assert len(input_vars) == len(h)
-        print("logit vars:", logit_vars)
-        print("probe_vars:", probe_vars)
         logit_offset = logit_vars[0]
-        probe_offset = probe_vars[0]
-
-        print("setting bounds for input")
-        for idx, v in enumerate(input_vars):
-            ipq.setLowerBound(v, h[idx]-eps)
-            ipq.setUpperBound(v, h[idx]+eps)
-
-
-        print(input["reconstructed_board_logits"])
+        probe_offset = probe_vars[0]        
+        print("constructing the property constaints...")
         print("adding constraints to make sure that the board stay the same")
         for i in range(probe_vars[0], probe_vars[-1], 3):
             print(i)
@@ -110,8 +125,7 @@ def trinity_robustness(input, sid:int, eps:float, sanity_check:bool = False):
             ipq.addEquation(c.toCoreEquation())
 
 
-        ASSIGNMENT_FILE = f"{eps}/assignments_{sid}_{true_label}vs{other_l}.txt"
-        queryFile = f"{eps}/finalQuery_{sid}_{true_label}vs{other_l}"
+        queryFile = f"{robust_property}/{eps}/finalQuery_{sid}_{true_label}vs{other_l}"
 
         MarabouCore.saveQuery(ipq, queryFile)
 
@@ -127,20 +141,22 @@ def trinity_robustness(input, sid:int, eps:float, sanity_check:bool = False):
                                     text=True, 
                                     timeout=TIMEOUT+10)
         #save results
-        with open(f"{eps}/benchmark_config.json", "w") as f:
+        with open(f"{robust_property}/{eps}/benchmark_config.json", "w") as f:
             json.dump(get_config(), f, indent=2)
 
-        with open(f"{eps}/solving_stdout_{sid}_{true_label}vs{other_l}", "w") as f:
+        with open(f"{robust_property}/{eps}/solving_stdout_{sid}_{true_label}vs{other_l}", "w") as f:
             f.write(marabouRes.stdout)
 
-        with open(f"{eps}/solving_stderr_{sid}_{true_label}vs{other_l}", "w") as f:
+        with open(f"{robust_property}/{eps}/solving_stderr_{sid}_{true_label}vs{other_l}", "w") as f:
             f.write(marabouRes.stderr)
 
         if os.path.exists("assignment.txt"):
-            os.rename("assignment.txt", ASSIGNMENT_FILE)
+            os.rename("assignment.txt", f"{robust_property}/{eps}/assignments_{sid}_{true_label}vs{other_l}.txt")
 
-EPS = 0.01
-if not os.path.exists(f"{EPS}"):
-    os.mkdir(f"{EPS}")
-for sid, d in enumerate(prepared_data):
-    trinity_robustness(d, sid, eps = EPS, sanity_check=False)
+EPS = 0.1
+ROBUST_PROPERTY = "Head-robust"
+if not os.path.exists(f"{ROBUST_PROPERTY}/{EPS}"):
+    os.makedirs(f"{ROBUST_PROPERTY}/{EPS}")
+for sid, d in enumerate(prepared_data[:1]):
+    trinity_robustness(d, sid, eps = EPS, 
+                       robust_property=ROBUST_PROPERTY, sanity_check=False)
